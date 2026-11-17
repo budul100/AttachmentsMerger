@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """
-Usage: python MergeAttachements.py <main.pdf> <attachments.zip> [extra1.pdf;extra2.pdf;...]
+Usage:
+    python merge.py <file1> <file2> [file3 ...]
+        Ordered mode: merges exactly the given files in the order of the arguments.
+        Supported inputs: PDFs, images and ZIP archives (ZIP contents are sorted
+        alphabetically and inserted at the position of the ZIP).
+
+    python merge.py <main.pdf>
+        Directory mode: the given PDF is the base, followed by the contents of the
+        single ZIP in the same directory (optional), followed by all other PDFs in
+        the same directory (sorted alphabetically).
+
+The output is written next to the first file as <first_filename>_.pdf.
 """
 
+import itertools
 import sys
-import os
-import zipfile
 import tempfile
+import zipfile
 from pathlib import Path
-from PIL import Image
-from pypdf import PdfWriter, PdfReader
+
 import img2pdf
+from PIL import Image
+from pypdf import PdfReader, PdfWriter
 
 SUPPORTED_IMAGES = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
-SUPPORTED_DOCS   = {'.pdf'}
+SUPPORTED_DOCS = {'.pdf'}
+SUPPORTED_ARCHIVES = {'.zip'}
+
+_temp_counter = itertools.count(1)
+
 
 def image_to_pdf_bytes(image_path: Path, tmp_dir: Path) -> Path:
     """Convert an image to a temporary PDF file. Returns path to the temp PDF."""
-    tmp_pdf = tmp_dir / (image_path.stem + '_converted.pdf')
+    tmp_pdf = tmp_dir / f"{next(_temp_counter)}_{image_path.stem}_converted.pdf"
 
     try:
         a4 = (img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297))
@@ -45,90 +61,138 @@ def image_to_pdf_bytes(image_path: Path, tmp_dir: Path) -> Path:
     return tmp_pdf
 
 
-def merge(main_pdf: str, zip_path: str, output_pdf: str, sibling_pdfs: list[str] = []):
-    writer = PdfWriter()
-
-    # --- 1. Add main PDF ---
-    print(f"[+] Adding main PDF: {main_pdf}")
-    with open(main_pdf, 'rb') as f:
-        reader = PdfReader(f)
+def append_pdf(writer: PdfWriter, pdf_path: Path) -> None:
+    with open(pdf_path, 'rb') as fh:
+        reader = PdfReader(fh)
         for page in reader.pages:
             writer.add_page(page)
 
-    # --- 2. Extract ZIP and sort contents (optional) ---
-    if zip_path:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
 
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(tmpdir)
+def append_image(writer: PdfWriter, image_path: Path, tmp_dir: Path) -> None:
+    tmp_pdf = image_to_pdf_bytes(image_path, tmp_dir)
+    append_pdf(writer, tmp_pdf)
 
-            all_files = sorted(
-                [p for p in tmpdir.rglob('*') if p.is_file()],
-                key=lambda p: str(p.relative_to(tmpdir)).lower()
-            )
 
-            print(f"[+] Found {len(all_files)} file(s) in ZIP:")
-            for f in all_files:
-                print(f"    {f.relative_to(tmpdir)}")
+def append_zip(writer: PdfWriter, zip_path: Path, tmp_dir: Path) -> None:
+    """Extract a ZIP and append its PDFs and images, sorted by relative path."""
+    extract_dir = tmp_dir / f"zip_{next(_temp_counter)}"
+    extract_dir.mkdir()
 
-            for file in all_files:
-                suffix = file.suffix.lower()
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(extract_dir)
 
-                if suffix in SUPPORTED_DOCS:
-                    print(f"[+] Appending PDF: {file.name}")
-                    with open(file, 'rb') as fh:
-                        reader = PdfReader(fh)
-                        for page in reader.pages:
-                            writer.add_page(page)
+    all_files = sorted(
+        [p for p in extract_dir.rglob('*') if p.is_file()],
+        key=lambda p: str(p.relative_to(extract_dir)).lower()
+    )
 
-                elif suffix in SUPPORTED_IMAGES:
-                    print(f"[+] Converting & appending image: {file.name}")
-                    tmp_pdf = image_to_pdf_bytes(file, tmpdir)
-                    with open(tmp_pdf, 'rb') as fh:
-                        reader = PdfReader(fh)
-                        for page in reader.pages:
-                            writer.add_page(page)
+    print(f"[+] Found {len(all_files)} file(s) in {zip_path.name}:")
+    for f in all_files:
+        print(f"    {f.relative_to(extract_dir)}")
 
-                else:
-                    print(f"[~] Skipping unsupported file: {file.name}")
-    else:
-        print("[~] No ZIP provided - skipping.")
+    for file in all_files:
+        suffix = file.suffix.lower()
 
-    # --- 3. Append sibling PDFs (alphabetically sorted by filename) ---
-    for sib in sorted(sibling_pdfs, key=lambda p: Path(p).name.lower()):
-        print(f"[+] Appending sibling PDF: {Path(sib).name}")
-        with open(sib, 'rb') as fh:
-            reader = PdfReader(fh)
-            for page in reader.pages:
-                writer.add_page(page)
+        if suffix in SUPPORTED_DOCS:
+            print(f"[+] Appending PDF: {file.name}")
+            append_pdf(writer, file)
+        elif suffix in SUPPORTED_IMAGES:
+            print(f"[+] Converting & appending image: {file.name}")
+            append_image(writer, file, extract_dir)
+        else:
+            print(f"[~] Skipping unsupported file: {file.name}")
 
-    # --- 4. Write output ---
-    with open(output_pdf, 'wb') as out:
-        writer.write(out)
+
+def merge(inputs: list[Path], output_pdf: Path) -> None:
+    """Merge the inputs into one PDF, strictly in the given order."""
+    writer = PdfWriter()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        for path in inputs:
+            suffix = path.suffix.lower()
+
+            if suffix in SUPPORTED_DOCS:
+                print(f"[+] Appending PDF: {path.name}")
+                append_pdf(writer, path)
+            elif suffix in SUPPORTED_IMAGES:
+                print(f"[+] Converting & appending image: {path.name}")
+                append_image(writer, path, tmp_dir)
+            elif suffix in SUPPORTED_ARCHIVES:
+                print(f"[+] Extracting ZIP: {path.name}")
+                append_zip(writer, path, tmp_dir)
+            else:
+                print(f"[~] Skipping unsupported file: {path.name}")
+
+        with open(output_pdf, 'wb') as out:
+            writer.write(out)
+
     print(f"\n[✓] Done! Output saved to: {output_pdf}")
 
 
+def collect_directory_inputs(main_pdf: Path) -> list[Path]:
+    """Directory mode: main PDF, then the single ZIP (if any), then sibling PDFs."""
+    directory = main_pdf.parent
+    siblings = [p for p in directory.iterdir() if p.is_file()]
+
+    zips = sorted((p for p in siblings if p.suffix.lower() == '.zip'),
+                  key=lambda p: p.name.lower())
+    if len(zips) > 1:
+        raise ValueError("More than one ZIP found - aborting.")
+
+    other_pdfs = sorted(
+        (p for p in siblings
+         if p.suffix.lower() == '.pdf' and p.name.lower() != main_pdf.name.lower()),
+        key=lambda p: p.name.lower()
+    )
+
+    inputs = [main_pdf]
+    if zips:
+        inputs.append(zips[0])
+    else:
+        print("[~] No ZIP file found - skipping ZIP attachments.")
+    inputs.extend(other_pdfs)
+    return inputs
+
+
+def main(args: list[str]) -> int:
+    if not args:
+        print(__doc__)
+        return 1
+
+    paths = [Path(a.strip()).resolve() for a in args if a.strip()]
+
+    missing = [p for p in paths if not p.is_file()]
+    if missing:
+        for p in missing:
+            print(f"Error: File not found: {p}")
+        return 1
+
+    if len(paths) == 1:
+        main_pdf = paths[0]
+        if main_pdf.suffix.lower() != '.pdf':
+            print(f"Error: A single input must be a PDF (directory mode): {main_pdf.name}")
+            return 1
+        try:
+            inputs = collect_directory_inputs(main_pdf)
+        except ValueError as e:
+            print(f"[!] {e}")
+            return 1
+    else:
+        inputs = paths
+
+    first = inputs[0]
+    output = first.parent / f"{first.stem}_.pdf"
+
+    print(f"[*] Merge order ({len(inputs)} input(s)):")
+    for i, p in enumerate(inputs, 1):
+        print(f"    {i}. {p.name}")
+    print()
+
+    merge(inputs, output)
+    return 0
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python MergeAttachements.py <main.pdf> <attachments.zip> [extra1.pdf;extra2.pdf;...]")
-        sys.exit(1)
-
-    main_pdf = sys.argv[1]
-    zip_path = sys.argv[2].strip() if len(sys.argv) > 2 else ""
-    stem     = Path(sys.argv[1]).stem
-    output   = f"{stem}_.pdf"
-
-    sibling_pdfs = []
-    if len(sys.argv) > 3 and sys.argv[3].strip():
-        sibling_pdfs = [p.strip() for p in sys.argv[3].split(';') if p.strip()]
-
-    if not os.path.exists(main_pdf):
-        print(f"Error: Main PDF not found: {main_pdf}")
-        sys.exit(1)
-
-    if zip_path and not os.path.exists(zip_path):
-        print(f"Error: ZIP file not found: {zip_path}")
-        sys.exit(1)
-
-    merge(main_pdf, zip_path, output, sibling_pdfs)
+    sys.exit(main(sys.argv[1:]))
